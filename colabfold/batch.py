@@ -18,6 +18,7 @@ import time
 import zipfile
 import shutil
 import pickle
+import collections
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -130,11 +131,11 @@ def mk_mock_template(
     output_confidence_scores = np.full(ln, 1.0)
 
     templates_all_atom_positions = np.zeros(
-        (ln, templates.residue_constants.atom_type_num, 3)
+        (ln, residue_constants.atom_type_num, 3)
     )
-    templates_all_atom_masks = np.zeros((ln, templates.residue_constants.atom_type_num))
-    templates_aatype = templates.residue_constants.sequence_to_onehot(
-        output_templates_sequence, templates.residue_constants.HHBLITS_AA_TO_ID
+    templates_all_atom_masks = np.zeros((ln, residue_constants.atom_type_num))
+    templates_aatype = residue_constants.sequence_to_onehot(
+        output_templates_sequence, residue_constants.HHBLITS_AA_TO_ID
     )
     template_features = {
         "template_all_atom_positions": np.tile(
@@ -144,6 +145,87 @@ def mk_mock_template(
             templates_all_atom_masks[None], [num_temp, 1, 1]
         ),
         "template_sequence": [f"none".encode()] * num_temp,
+        "template_aatype": np.tile(np.array(templates_aatype)[None], [num_temp, 1, 1]),
+        "template_confidence_scores": np.tile(
+            output_confidence_scores[None], [num_temp, 1]
+        ),
+        "template_domain_names": [f"none".encode()] * num_temp,
+        "template_release_date": [f"none".encode()] * num_temp,
+        "template_sum_probs": np.zeros([num_temp], dtype=np.float32),
+    }
+    return template_features
+
+def mk_initial_guess_template(
+    query_sequence: Union[List[str], str], 
+    initial_guess_pdb: str,
+    num_temp: int = 1) -> Dict[str, Any]:
+    ln = (
+        len(query_sequence)
+        if isinstance(query_sequence, str)
+        else sum(len(s) for s in query_sequence)
+    )
+
+    with open(initial_guess_pdb, 'r') as pdb_file:
+        lines = pdb_file.readlines()
+
+    idx_s = ['%i_%s'%(int(l[22:26]),l[21]) for l in lines if l[:4]=="ATOM" and l[12:16].strip()=="CA"]
+    num_res = len(idx_s)
+
+    all_atom_positions = np.zeros((ln, residue_constants.atom_type_num, 3))
+    all_atom_masks = np.zeros((ln, residue_constants.atom_type_num))
+
+    residues = collections.defaultdict(list)
+
+    # Possible number of atoms: 4BB + 10SC atoms
+    xyz = np.full((len(idx_s), 14, 3), np.nan, dtype=np.float32)
+    for l in lines:
+        # only get atom lines from PDB
+        if l[:4] != "ATOM":
+            continue
+        resNo, atom, aa, chain_id, ab_label = int(l[22:26]), l[12:16], l[17:20], l[21], l[26]
+        tag='%i_%s'%(resNo,chain_id)
+
+        # more than 1 atom is appended to the same tag!
+        residues[tag].append((atom.strip(), aa, [float(l[30:38]), float(l[38:46]), float(l[46:54])]))
+
+    for tag in residues:
+
+        pos = np.zeros([residue_constants.atom_type_num, 3], dtype=np.float32)
+        mask = np.zeros([residue_constants.atom_type_num], dtype=np.float32)
+
+        for atom in residues[tag]:
+            atom_name = atom[0]
+            x, y, z = atom[2]
+            if atom_name in residue_constants.atom_order.keys():
+                pos[residue_constants.atom_order[atom_name]] = [x, y, z]
+                mask[residue_constants.atom_order[atom_name]] = 1.0
+            elif atom_name.upper() == 'SE' and res.get_resname() == 'MSE':
+                # Put the coordinates of the selenium atom in the sulphur column
+                pos[residue_constants.atom_order['SD']] = [x, y, z]
+                mask[residue_constants.atom_order['SD']] = 1.0
+
+        idx = idx_s.index(tag) # same order of residue as pdb file
+        all_atom_positions[idx] = pos
+        all_atom_masks[idx] = mask
+
+    output_confidence_scores = np.full(ln, 1.0)
+    
+    templates_aatype = residue_constants.sequence_to_onehot(
+        query_sequence, residue_constants.HHBLITS_AA_TO_ID
+    ) 
+
+    templates_aatype = residue_constants.sequence_to_onehot(
+        query_sequence, residue_constants.HHBLITS_AA_TO_ID
+    )
+
+    template_features = {
+        "template_all_atom_positions": np.tile(
+            all_atom_positions[None], [num_temp, 1, 1, 1]
+        ),
+        "template_all_atom_masks": np.tile(
+            all_atom_masks[None], [num_temp, 1, 1]
+        ),
+        "template_sequence": [query_sequence.encode()] * num_temp,
         "template_aatype": np.tile(np.array(templates_aatype)[None], [num_temp, 1, 1]),
         "template_confidence_scores": np.tile(
             output_confidence_scores[None], [num_temp, 1]
@@ -242,7 +324,7 @@ def convert_pdb_to_mmcif(pdb_file: Path):
     structure = parser.get_structure(i, pdb_file)
     cif_io = CFMMCIFIO()
     cif_io.set_structure(structure)
-    cif_io.save(str(cif_file), ReplaceOrRemoveHetatmSelect())
+    cif_io.save(str(cif_file))
 
 def mk_hhsearch_db(template_dir: str):
     template_path = Path(template_dir)
@@ -767,6 +849,7 @@ def get_msa_and_templates(
     msa_mode: str,
     use_templates: bool,
     custom_template_path: str,
+    initial_guess_pdb: str,
     pair_mode: str,
     host_url: str = DEFAULT_API_SERVER,
 ) -> Tuple[
@@ -802,7 +885,7 @@ def get_msa_and_templates(
         if custom_template_path is not None:
             template_paths = {}
             for index in range(0, len(query_seqs_unique)):
-                template_paths[index] = custom_template_path
+                template_paths[index] = custom_template_path         
         if template_paths is None:
             logger.info("No template detected")
             for index in range(0, len(query_seqs_unique)):
@@ -874,7 +957,7 @@ def get_msa_and_templates(
                 paired_a3m_lines.append(f">{num+i}\n{query_seqs_unique[0]}\n")
     else:
         paired_a3m_lines = None
-
+    
     return (
         a3m_lines,
         paired_a3m_lines,
@@ -993,11 +1076,31 @@ def generate_input_feature(
     is_complex: bool,
     model_type: str,
     max_seq: int,
+    initial_guess_pdb: str = None,
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
 
     input_feature = {}
     domain_names = {}
-    if is_complex and "multimer" not in model_type:
+
+
+    if initial_guess_pdb is not None:
+        
+        full_sequence = ""
+        Ls = []
+        for sequence_index, sequence in enumerate(query_seqs_unique):
+            for cardinality in range(0, query_seqs_cardinality[sequence_index]):
+                full_sequence += sequence
+                Ls.append(len(sequence))
+
+        # bugfix
+        a3m_lines = f">0\n{full_sequence}\n"
+        a3m_lines += pair_msa(query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa)        
+
+        input_feature = build_monomer_feature(full_sequence, a3m_lines, mk_initial_guess_template(full_sequence, initial_guess_pdb))
+        input_feature["residue_index"] = np.concatenate([np.arange(L) for L in Ls])
+        input_feature["asym_id"] = np.concatenate([np.full(L,n) for n,L in enumerate(Ls)])
+
+    elif is_complex and "multimer" not in model_type:
 
         full_sequence = ""
         Ls = []
@@ -1206,6 +1309,7 @@ def run(
     msa_mode: str = "mmseqs2_uniref_env",
     use_templates: bool = False,
     custom_template_path: str = None,
+    initial_guess_pdb: str = None,
     num_relax: int = 0,
     keep_existing_results: bool = True,
     rank_by: str = "auto",
@@ -1260,6 +1364,8 @@ def run(
     data_dir = Path(data_dir)
     result_dir = Path(result_dir)
     result_dir.mkdir(exist_ok=True)
+    if initial_guess_pdb is not None:
+        is_complex = False
     model_type = set_model_type(is_complex, model_type)
 
     # determine model extension
@@ -1402,7 +1508,7 @@ def run(
             if use_templates or a3m_lines is None:
                 (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
                 = get_msa_and_templates(jobname, query_sequence, result_dir, msa_mode, use_templates, 
-                    custom_template_path, pair_mode, host_url)
+                    custom_template_path, initial_guess_pdb, pair_mode, host_url)
             if a3m_lines is not None:
                 (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features_) \
                 = unserialize_msa(a3m_lines, query_sequence)
@@ -1422,7 +1528,7 @@ def run(
         try:
             (feature_dict, domain_names) \
             = generate_input_feature(query_seqs_unique, query_seqs_cardinality, unpaired_msa, paired_msa,
-                                     template_features, is_complex, model_type, max_seq=max_seq)
+                                     template_features, is_complex, model_type, max_seq=max_seq, initial_guess_pdb=initial_guess_pdb)
             
             # to allow display of MSA info during colab/chimera run (thanks tomgoddard)
             if feature_dict_callback is not None:
@@ -1692,6 +1798,11 @@ def main():
         default=None,
         help="Directory with pdb files to be used as input",
     )
+    parser.add_argument("--initial-guess",
+        type=str,
+        default=None,
+        help="Pdb file to be used as the initial guess",
+    )
     parser.add_argument("--rank",
         help="rank models by auto, plddt or ptmscore",
         type=str,
@@ -1791,6 +1902,8 @@ def main():
     data_dir = Path(args.data or default_data_dir)
 
     queries, is_complex = get_queries(args.input, args.sort_queries_by)
+    if args.initial_guess is not None:
+        is_complex = False
     model_type = set_model_type(is_complex, args.model_type)
         
     download_alphafold_params(model_type, data_dir)
@@ -1813,6 +1926,7 @@ def main():
         result_dir=args.results,
         use_templates=args.templates,
         custom_template_path=args.custom_template_path,
+        initial_guess_pdb=args.initial_guess,
         num_relax=args.num_relax,
         msa_mode=args.msa_mode,
         model_type=model_type,
@@ -1846,3 +1960,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
